@@ -1,0 +1,7 @@
+# 忽略所有 CSV 檔案
+*.csv
+*.h5
+*.keras
+*.pt
+.ipynb_checkpoints/
+__pycache__/
