@@ -5,3 +5,8 @@
 *.pt
 .ipynb_checkpoints/
 __pycache__/
+*.csv
+*.pt
+all_submissions/
+training_history.csv
+.ipynb_checkpoints/
