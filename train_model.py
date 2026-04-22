@@ -49,14 +49,14 @@ torch.autograd.set_detect_anomaly(True)
 SEED = 77
 MAX_SEQ_LEN = 15
 BATCH_SIZE = 256
-EPOCHS = 30  #50
-N_FOLDS = 3  #5
-PATIENCE = 40           
-LR = 5e-5               
+EPOCHS = 50  #50
+N_FOLDS = 5  #5
+PATIENCE = 30           
+LR = 5e-4               
 D_MODEL = 128
 N_HEADS = 4
 N_LAYERS = 3
-DROPOUT = 0.2           
+DROPOUT = 0.3           
 LOSS_W = {'action': 0.4, 'point': 1.5, 'sgp': 0.2}
 N_ACTION_CLASSES = 19
 N_POINT_CLASSES = 10
@@ -103,7 +103,7 @@ CAT_COLS = [
     'sex', 'strikeId', 'handId', 'strengthId', 'spinId', 
     'positionId', 'gamePlayerId', 'gamePlayerOtherId'  
 ]
-NUM_COLS = ['strikeNumber', 'scoreSelf', 'scoreOther',
+NUM_COLS = ['strikeNumber', 'scoreSelf', 'scoreOther','numberGame',
             'score_diff', 'is_first_strike', 'is_early_rally']
 
 # ──────────────────────────────────────────────
@@ -349,7 +349,7 @@ class MultiTaskTransformer(nn.Module):
             nn.Linear(D_MODEL // 2, N_POINT_CLASSES),
         )
         self.head_sgp = nn.Sequential(
-            nn.Linear(D_MODEL, D_MODEL // 2),
+            nn.Linear(D_MODEL * 2, D_MODEL // 2),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
             nn.Linear(D_MODEL // 2, 1),
@@ -373,12 +373,16 @@ class MultiTaskTransformer(nn.Module):
         out_point  = self.head_point(x)    # (B, L, 10)
 
         real_mask_float = (~mask).unsqueeze(-1).float()   # (B, L, 1)
-        last_idx = (real_mask_float.squeeze(-1).cumsum(dim=1) - 1).argmax(dim=1)  # (B,)
-        last_idx = last_idx.clamp(min=0, max=x.shape[1] - 1)
-        last_idx_exp = last_idx.view(B, 1, 1).expand(B, 1, D_MODEL)
-        h_last = x.gather(1, last_idx_exp).squeeze(1)  # (B, D_MODEL)
-        h_last = torch.nan_to_num(h_last, nan=0.0)
-        out_sgp = self.head_sgp(h_last).squeeze(-1)
+        token_counts = real_mask_float.sum(dim=1).clamp(min=1)
+        h_mean = (x * real_mask_float).sum(dim=1) / token_counts   # (B, D_MODEL)
+        h_max  = x.masked_fill(mask.unsqueeze(-1), float('-inf')).max(dim=1).values  # (B, D_MODEL)
+        h_sgp  = torch.cat([h_mean, h_max], dim=-1)  # (B, D_MODEL * 2)
+        #last_idx = (real_mask_float.squeeze(-1).cumsum(dim=1) - 1).argmax(dim=1)  # (B,)
+        #last_idx = last_idx.clamp(min=0, max=x.shape[1] - 1)
+        #last_idx_exp = last_idx.view(B, 1, 1).expand(B, 1, D_MODEL)
+        #h_last = x.gather(1, last_idx_exp).squeeze(1)  # (B, D_MODEL)
+        #h_last = torch.nan_to_num(h_last, nan=0.0)
+        out_sgp = self.head_sgp(h_sgp).squeeze(-1)
 
         return out_action, out_point, out_sgp
 
