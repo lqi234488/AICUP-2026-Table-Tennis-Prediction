@@ -6,6 +6,20 @@ Task 2: pointId    (10 classes) -> Macro F1  (weight 0.4)
 Task 3: serverGetPoint (binary) -> AUC-ROC   (weight 0.2)
 
 資料結構：每個 rally_uid 有多拍序列，用前 n-1 拍預測第 n 拍
+# 定義類別對照表
+POINT_MAP = {
+    0: "無/不計", # 修正：ID 0 通常代表沒落點（失誤）
+    1: "正手位置短球", 2: "中間短球", 3: "反手位置短球",
+    4: "正手位置半出台球", 5: "中路半出台球", 6: "反手位置短半出台球",
+    7: "正手位置長球", 8: "中間長球", 9: "反手位置長球"
+}
+
+ACTION_MAP = {
+    0: "無", 1: "拉球", 2: "反拉", 3: "殺球", 4: "擰球",
+    5: "快帶", 6: "推擠", 7: "挑撥", 8: "拱球", 9: "磕球",
+    10: "搓球", 11: "擺短", 12: "削球", 13: "擋球", 14: "放高球",
+    15: "傳統", 16: "勾手", 17: "逆旋轉", 18: "下蹲式"
+}
 """
 
 """
@@ -18,6 +32,7 @@ import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import GroupKFold
 
 import torch
 import torch.nn as nn
@@ -26,21 +41,28 @@ from torch.utils.data import Dataset, DataLoader
 #os.environ['CUDA_VISIBLE_DEVICES'] = '5'  如果沒有超過五張會變成CPU 不如不指定讓他自動抓
 import datetime
 import collections
-torch.autograd.set_detect_anomaly(True) # 加在程式最開頭
+torch.autograd.set_detect_anomaly(True) 
 
 # ──────────────────────────────────────────────
-# 設定
+# 參數設定
 # ──────────────────────────────────────────────
 SEED = 77
-MAX_SEQ_LEN = 30
+MAX_SEQ_LEN = 15
 BATCH_SIZE = 256
-EPOCHS = 1000
-PATIENCE = 25           # Early Stopping 容忍 Epoch 數
-LR = 5e-5               # 調降初始學習率，避免振盪
+EPOCHS = 30  #50
+N_FOLDS = 3  #5
+PATIENCE = 40           
+LR = 5e-5               
 D_MODEL = 128
 N_HEADS = 4
-N_LAYERS = 4
-DROPOUT = 0.2           # 提高 Dropout 增加正則化強度
+N_LAYERS = 3
+DROPOUT = 0.2           
+LOSS_W = {'action': 0.4, 'point': 1.5, 'sgp': 0.2}
+N_ACTION_CLASSES = 19
+N_POINT_CLASSES = 10
+DEBUG_MODE = False
+OVERFIT_TEST = False
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 OUTPUT_DIR = "all_submissions"
 
@@ -53,10 +75,20 @@ print(f"Using device: {DEVICE}")
 # ──────────────────────────────────────────────
 train_df = pd.read_csv("train.csv")
 test_df  = pd.read_csv("test.csv")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────
 # 2. 特徵欄位定義
 # ──────────────────────────────────────────────
+# 衍生特徵
+train_df['score_diff'] = train_df['scoreSelf'] - train_df['scoreOther']
+test_df['score_diff']  = test_df['scoreSelf']  - test_df['scoreOther']
+
+train_df['is_first_strike'] = (train_df['strikeNumber'] == 1).astype(int)
+test_df['is_first_strike']  = (test_df['strikeNumber']  == 1).astype(int)
+
+train_df['is_early_rally'] = (train_df['strikeNumber'] <= 3).astype(int)
+test_df['is_early_rally']  = (test_df['strikeNumber']  <= 3).astype(int)
 FEATURE_COLS = [
     'sex', 'match', 'numberGame', 'rally_id',
     'strikeNumber', 'scoreSelf', 'scoreOther',
@@ -71,7 +103,8 @@ CAT_COLS = [
     'sex', 'strikeId', 'handId', 'strengthId', 'spinId', 
     'positionId', 'gamePlayerId', 'gamePlayerOtherId'  
 ]
-NUM_COLS = ['strikeNumber', 'scoreSelf', 'scoreOther']
+NUM_COLS = ['strikeNumber', 'scoreSelf', 'scoreOther',
+            'score_diff', 'is_first_strike', 'is_early_rally']
 
 # ──────────────────────────────────────────────
 # 3. Encoding
@@ -84,7 +117,8 @@ ALL_ENCODE_COLS = CAT_COLS + ['pointId']
 encoders = {}
 for col in ALL_ENCODE_COLS:
     le = LabelEncoder()
-    all_df[col] = le.fit_transform(all_df[col].astype(str)) 
+    # 確保用數值排序，這樣 ID 0~18 才會對應到索引 0~18
+    all_df[col] = le.fit_transform(all_df[col].fillna(-1).astype(int)) 
     encoders[col] = le
 
 n_train = len(train_df)
@@ -113,16 +147,23 @@ def build_sequences(df, is_test=False):
             # 測試集維持不變：用前面所有拍數預測最後一拍
             history = g.iloc[:-1]
             target_row = g.iloc[-1]
+            if len(history) == 0:
+                cat_seq = (target_row[CAT_COLS].values.astype(np.int64) + 1).reshape(1, -1)
+                num_seq = target_row[NUM_COLS].values.astype(np.float32).reshape(1, -1)
+            else:
+                cat_seq = (history[CAT_COLS].values.astype(np.int64)) + 1
+                num_seq = history[NUM_COLS].values.astype(np.float32)
             
-            cat_seq = (history[CAT_COLS].values.astype(np.int64)) + 1
-            num_seq = history[NUM_COLS].values.astype(np.float32)
-            
+            if len(cat_seq) > MAX_SEQ_LEN:
+                cat_seq = cat_seq[-MAX_SEQ_LEN:]
+                num_seq = num_seq[-MAX_SEQ_LEN:]
+
             sequences.append({
                 'rally_uid': rally_uid,
-                'cat_seq': cat_seq, 'num_seq': num_seq, 'seq_len': len(history),
-                'actionId': int(target_row['actionId']),
-                'pointId': int(target_row['pointId']),
-                'serverGetPoint': int(target_row['serverGetPoint']),
+                'cat_seq': cat_seq, 'num_seq': num_seq, 'seq_len': len(cat_seq),
+                'actionId': 0,
+                'pointId': 0,
+                'serverGetPoint': 0,
             })
         else:
             # 訓練集：使用滑動視窗！
@@ -148,29 +189,38 @@ def build_sequences(df, is_test=False):
                 })
 
     return sequences
-
 print("Building sequences...")
 train_seqs = build_sequences(train_df, is_test=False)
-# 檢查前 5 個序列的目標值
-#print("\n [數據抽檢] 檢查 sequences 裡的目標值：")
-#for i in range(5):
-#    s = train_seqs[i]
-#    print(f"Rally: {s['rally_uid']} | actionId: {s['actionId']} | pointId: {s['pointId']}")
-
-# 檢查 pointId 的數值範圍
-#all_p_targets = [s['pointId'] for s in train_seqs]
-#print(f"\n pointId 目標值範圍: {min(all_p_targets)} ~ {max(all_p_targets)}")
-# 統計所有訓練序列中的 pointId 數量
-#p_counts = collections.Counter([s['pointId'] for s in train_seqs])
-
-#print("\n [全量標籤統計] pointId 在訓練集中的分佈：")
-#total = sum(p_counts.values())
-#for pid, count in sorted(p_counts.items()):
-#    percentage = (count / total) * 100
-#    print(f"ID {pid}: {count:6d} 筆 ({percentage:5.1f}%) {'█' * int(percentage/2)}")
-#print(f" pointId 不重複數值數量: {len(set(all_p_targets))}")
-###
 test_seqs  = build_sequences(test_df,  is_test=True)
+
+if DEBUG_MODE:
+    #檢查前 5 個序列的目標值
+    print("\n [數據抽檢] 檢查 sequences 裡的目標值：")
+    for i in range(5):
+        s = train_seqs[i]
+        print(f"Rally: {s['rally_uid']} | actionId: {s['actionId']} | pointId: {s['pointId']}")
+
+    #檢查 pointId 的數值範圍
+    all_p_targets = [s['pointId'] for s in train_seqs]
+    print(f"\n pointId 目標值範圍: {min(all_p_targets)} ~ {max(all_p_targets)}")
+    #統計所有訓練序列中的 pointId 數量
+    p_counts = collections.Counter([s['pointId'] for s in train_seqs])
+
+    print("\n [全量標籤統計] pointId 在訓練集中的分佈：")
+    total = sum(p_counts.values())
+    for pid, count in sorted(p_counts.items()):
+        percentage = (count / total) * 100
+        print(f"ID {pid}: {count:6d} 筆 ({percentage:5.1f}%) {'█' * int(percentage/2)}")
+    print(f" pointId 不重複數值數量: {len(set(all_p_targets))}") 
+
+    lengths = pd.Series([s['seq_len'] for s in train_seqs])
+    print("\n📊 序列長度分佈：")
+    print(lengths.describe().round(2))
+    print(f"\n分位數：")
+    print(lengths.quantile([0.5, 0.75, 0.9, 0.95]).round(0))
+    zero_len = [s for s in test_seqs if s['seq_len'] == 0]
+    print(f"DEBUG: seq_len=0 的測試序列數量 = {len(zero_len)}")
+
 print(f"  Train sequences: {len(train_seqs)}")
 print(f"  Test  sequences: {len(test_seqs)}")
 
@@ -191,11 +241,14 @@ def collate_fn(batch):
         num_pad = np.pad(s['num_seq'], ((pad, 0), (0, 0)), mode='constant', constant_values=0.0)
         mask    = [True] * pad + [False] * L
 
+        action_seq = [-1] * (max_len - 1) + [s['actionId']]
+        point_seq  = [-1] * (max_len - 1) + [s['pointId']]
+
         cat_list.append(cat_pad)
         num_list.append(num_pad)
         mask_list.append(mask)
-        action_list.append(s['actionId'])
-        point_list.append(s['pointId'])
+        action_list.append(action_seq)
+        point_list.append(point_seq)
         sgp_list.append(s['serverGetPoint'])
         uid_list.append(s['rally_uid'])
 
@@ -224,6 +277,30 @@ tr_idx, val_idx = next(gss.split(train_seqs, groups=rally_uids))
 tr_set  = RallyDataset([train_seqs[i] for i in tr_idx])
 val_set = RallyDataset([train_seqs[i] for i in val_idx])
 te_set  = RallyDataset(test_seqs)
+
+tr_seqs_subset = [train_seqs[i] for i in tr_idx]
+val_seqs_subset = [train_seqs[i] for i in val_idx]
+
+def print_dist(seqs, name):
+    action_counts = collections.Counter([s['actionId'] for s in seqs])
+    point_counts  = collections.Counter([s['pointId']  for s in seqs])
+    total = len(seqs)
+    print(f"\n{'='*20} {name} (共 {total} 筆) {'='*20}")
+    print("actionId 分佈（前5常見）:")
+    for k, v in sorted(action_counts.items(), key=lambda x: -x[1])[:5]:
+        print(f"  class {k:2d}: {v:5d} ({v/total*100:.1f}%)")
+    print("pointId 分佈（前5常見）:")
+    for k, v in sorted(point_counts.items(), key=lambda x: -x[1])[:5]:
+        print(f"  class {k:2d}: {v:5d} ({v/total*100:.1f}%)")
+if DEBUG_MODE:
+    print_dist(tr_seqs_subset,  "Train")
+    print_dist(val_seqs_subset, "Val")
+
+if OVERFIT_TEST:
+    tiny_seqs = train_seqs[:100]
+    tr_set  = RallyDataset(tiny_seqs)
+    val_set = RallyDataset(tiny_seqs)  # 刻意用同一份，看能不能記住
+    print("⚠️  過擬合測試模式：只用 100 筆資料")
 
 tr_loader  = DataLoader(tr_set,  batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_fn, num_workers=0)
 val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn, num_workers=0)
@@ -263,13 +340,13 @@ class MultiTaskTransformer(nn.Module):
             nn.Linear(D_MODEL, D_MODEL // 2),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
-            nn.Linear(D_MODEL // 2, 19),
+            nn.Linear(D_MODEL // 2, N_ACTION_CLASSES),
         )
         self.head_point = nn.Sequential(
             nn.Linear(D_MODEL, D_MODEL // 2),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
-            nn.Linear(D_MODEL // 2, 10),
+            nn.Linear(D_MODEL // 2, N_POINT_CLASSES),
         )
         self.head_sgp = nn.Sequential(
             nn.Linear(D_MODEL, D_MODEL // 2),
@@ -287,18 +364,21 @@ class MultiTaskTransformer(nn.Module):
 
         positions = torch.arange(1, L + 1, device=x.device).unsqueeze(0)
         positions = positions.masked_fill(mask, 0)
+        positions = positions.clamp(max=MAX_SEQ_LEN)
         x = x + self.pos_enc(positions)
 
         x = self.transformer(x, src_key_padding_mask=mask)
 
-        real_mask = ~mask
-        last_idx = real_mask.long().cumsum(dim=1).argmax(dim=1)
-        last_idx_exp = last_idx.view(B, 1, 1).expand(B, 1, D_MODEL)
-        h = x.gather(1, last_idx_exp).squeeze(1)
+        out_action = self.head_action(x)   # (B, L, 19)
+        out_point  = self.head_point(x)    # (B, L, 10)
 
-        out_action = self.head_action(h)
-        out_point  = self.head_point(h)
-        out_sgp    = self.head_sgp(h).squeeze(-1)
+        real_mask_float = (~mask).unsqueeze(-1).float()   # (B, L, 1)
+        last_idx = (real_mask_float.squeeze(-1).cumsum(dim=1) - 1).argmax(dim=1)  # (B,)
+        last_idx = last_idx.clamp(min=0, max=x.shape[1] - 1)
+        last_idx_exp = last_idx.view(B, 1, 1).expand(B, 1, D_MODEL)
+        h_last = x.gather(1, last_idx_exp).squeeze(1)  # (B, D_MODEL)
+        h_last = torch.nan_to_num(h_last, nan=0.0)
+        out_sgp = self.head_sgp(h_last).squeeze(-1)
 
         return out_action, out_point, out_sgp
 
@@ -308,7 +388,7 @@ model = MultiTaskTransformer().to(DEVICE)
 # 7. 損失函數 & 優化器
 # ──────────────────────────────────────────────
 def compute_class_weights(seqs, key, n_classes):
-    labels = np.array([s[key] for s in train_seqs])
+    labels = np.array([s[key] for s in seqs])
     counts = np.bincount(labels, minlength=n_classes).astype(float)
     counts = np.where(counts == 0, 1, counts)
     weights = counts.sum() / (n_classes * counts)
@@ -321,11 +401,9 @@ action_weights = compute_class_weights(train_seqs, 'actionId', 19)
 point_weights  = compute_class_weights(train_seqs, 'pointId',  10)
 
 # 關鍵修正：移除 label_smoothing，避免與 class weights 發生數學衝突
-criterion_action = nn.CrossEntropyLoss(weight=action_weights)
-criterion_point  = nn.CrossEntropyLoss(weight=point_weights)
+criterion_action = nn.CrossEntropyLoss(weight=action_weights, ignore_index=-1)
+criterion_point  = nn.CrossEntropyLoss(weight=point_weights,  ignore_index=-1)
 criterion_sgp    = nn.BCEWithLogitsLoss()
-
-LOSS_W = {'action': 0.4, 'point': 1.5, 'sgp': 0.2}
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
 
@@ -345,8 +423,7 @@ def run_epoch(loader, training=True):
     all_point_pred,  all_point_true  = [], []
     all_sgp_prob,    all_sgp_true    = [], []
 
-    ctx = torch.enable_grad() if training else torch.no_grad()
-    with ctx:
+    with torch.set_grad_enabled(training):
         for batch in loader:
             cat  = batch['cat'].to(DEVICE)
             num  = batch['num'].to(DEVICE)
@@ -357,9 +434,9 @@ def run_epoch(loader, training=True):
 
             logit_a, logit_p, logit_s = model(cat, num, mask)
 
-            loss_a = criterion_action(logit_a, y_action)
-            loss_p = criterion_point(logit_p,  y_point)
-            loss_s = criterion_sgp(logit_s,    y_sgp)
+            loss_a = criterion_action(logit_a.view(-1, N_ACTION_CLASSES), y_action.view(-1))
+            loss_p = criterion_point( logit_p.view(-1, N_POINT_CLASSES), y_point.view(-1))
+            loss_s = criterion_sgp(logit_s, y_sgp)
             loss   = (LOSS_W['action'] * loss_a
                     + LOSS_W['point']  * loss_p
                     + LOSS_W['sgp']    * loss_s)
@@ -372,10 +449,16 @@ def run_epoch(loader, training=True):
 
             total_loss += loss.item() * len(y_action)
 
-            all_action_pred.extend(logit_a.argmax(dim=1).cpu().numpy())
-            all_action_true.extend(y_action.cpu().numpy())
-            all_point_pred.extend(logit_p.argmax(dim=1).cpu().numpy())
-            all_point_true.extend(y_point.cpu().numpy())
+            a_flat   = y_action.view(-1).cpu().numpy()
+            a_pred   = logit_a.view(-1, 19).argmax(dim=1).cpu().numpy()
+            mask_a   = (a_flat != -1)
+            all_action_pred.extend(a_pred[mask_a])
+            all_action_true.extend(a_flat[mask_a])
+            p_flat   = y_point.view(-1).cpu().numpy()
+            p_pred   = logit_p.view(-1, 10).argmax(dim=1).cpu().numpy()
+            mask_p   = (p_flat != -1)
+            all_point_pred.extend(p_pred[mask_p])
+            all_point_true.extend(p_flat[mask_p])
             all_sgp_prob.extend(torch.sigmoid(logit_s).detach().cpu().numpy())
             all_sgp_true.extend(y_sgp.cpu().numpy())
     
@@ -401,157 +484,155 @@ def run_epoch(loader, training=True):
     }
 
 # ──────────────────────────────────────────────
-# 9. 訓練迴圈
+# 9. K-Fold 訓練迴圈
 # ──────────────────────────────────────────────
-best_score = 0.0
-best_state = None
-history = []
-epochs_no_improve = 0  # 實作 Early Stopping 計數器
+gkf = GroupKFold(n_splits=N_FOLDS)
+rally_uids = np.array([s['rally_uid'] for s in train_seqs])
 
-print("\n=== Training Start ===")
-for epoch in range(1, EPOCHS + 1):
-    tr_metrics  = run_epoch(tr_loader,  training=True)
-    val_metrics = run_epoch(val_loader, training=False)
-    
-    # Scheduler 根據 Validation Overall Score 調整 LR
-    scheduler.step(val_metrics['overall'])
+all_fold_preds = []  # 存每個 fold 的測試集預測
+all_history = []
+overall_best_score = 0.0
 
-    history.append({'epoch': epoch, **{f'tr_{k}': v for k, v in tr_metrics.items()},
-                                     **{f'val_{k}': v for k, v in val_metrics.items()}})
+print("\n=== K-Fold Training Start ===")
 
-    if epoch % 5 == 0 or epoch == 1:
-        print(f"Epoch {epoch:03d}/{EPOCHS} | "
-              f"Loss {tr_metrics['loss']:.4f}/{val_metrics['loss']:.4f} | "
-              f"F1-action {tr_metrics['f1_action']:.4f}/{val_metrics['f1_action']:.4f} | "
-              f"F1-point {tr_metrics['f1_point']:.4f}/{val_metrics['f1_point']:.4f} | "
-              f"AUC {tr_metrics['auc_sgp']:.4f}/{val_metrics['auc_sgp']:.4f} | "
-              f"Overall {val_metrics['overall']:.4f}")
+for fold, (tr_idx, val_idx) in enumerate(gkf.split(train_seqs, groups=rally_uids)):
+    print(f"\n{'='*20} Fold {fold+1}/{N_FOLDS} {'='*20}")
 
-    if val_metrics['overall'] > best_score:
-        if not np.isnan(val_metrics['loss']):
-            best_score = val_metrics['overall']
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            
-            # 1. 強制覆蓋 logic
-            model_path = 'best_model.pt'
-            if os.path.exists(model_path):
-                try: os.remove(model_path)
-                except: pass
-            
-            # 2. 存入硬碟 (確保就算當機也有一份在硬碟裡)
-            torch.save(best_state, model_path)
-            
-            # 3. 備份一份帶時間和分數的 (方便 check2.py 追蹤)
-            timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
-            # 這裡修正了變數名稱，改用 val_metrics['loss']
-            ver_path = os.path.join(OUTPUT_DIR, f"model_loss_{val_metrics['loss']:.4f}_{timestamp}.pt")
-            torch.save(best_state, ver_path)
-            
-            print(f"  ★ 發現更強模型！Score: {best_score:.4f} | 已存檔：{ver_path}")
-            epochs_no_improve = 0
-    else:
-        epochs_no_improve += 1
+    tr_set  = RallyDataset([train_seqs[i] for i in tr_idx])
+    val_set = RallyDataset([train_seqs[i] for i in val_idx])
+    tr_loader  = DataLoader(tr_set,  batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_fn, num_workers=0)
+    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn, num_workers=0)
 
-    # 觸發 Early Stopping
-    if epochs_no_improve >= PATIENCE:
-        print(f"\nEarly stopping triggered at epoch {epoch}")
-        break
+    # 每個 fold 重新初始化模型和優化器
+    model = MultiTaskTransformer().to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-6
+    )
 
-print(f"\nBest validation overall score: {best_score:.4f}")
-pd.DataFrame(history).to_csv("training_history.csv", index=False)
+    best_score = 0.0
+    best_state = None
+    epochs_no_improve = 0
+    fold_history = []
+
+    for epoch in range(1, EPOCHS + 1):
+        tr_metrics  = run_epoch(tr_loader,  training=True)
+        val_metrics = run_epoch(val_loader, training=False)
+        scheduler.step(val_metrics['overall'])
+
+        fold_history.append({
+            'fold': fold + 1,
+            'epoch': epoch,
+            **{f'tr_{k}': v for k, v in tr_metrics.items()},
+            **{f'val_{k}': v for k, v in val_metrics.items()}
+        })
+
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"Fold {fold+1} | Epoch {epoch:03d}/{EPOCHS} | "
+                  f"Loss {tr_metrics['loss']:.4f}/{val_metrics['loss']:.4f} | "
+                  f"F1-action {tr_metrics['f1_action']:.4f}/{val_metrics['f1_action']:.4f} | "
+                  f"F1-point {tr_metrics['f1_point']:.4f}/{val_metrics['f1_point']:.4f} | "
+                  f"AUC {tr_metrics['auc_sgp']:.4f}/{val_metrics['auc_sgp']:.4f} | "
+                  f"Overall {val_metrics['overall']:.4f}")
+
+        if val_metrics['overall'] > best_score:
+            if not np.isnan(val_metrics['loss']):
+                best_score = val_metrics['overall']
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
+                
+                # 存這個 fold 的最佳模型
+                fold_model_path = os.path.join(OUTPUT_DIR, f"best_model_fold{fold+1}.pt")
+                torch.save(best_state, fold_model_path)
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= PATIENCE:
+            print(f"  Early stopping at epoch {epoch}")
+            break
+
+    print(f"Fold {fold+1} best val score: {best_score:.4f}")
+    all_history.extend(fold_history)
+
+    if best_score > overall_best_score:
+        overall_best_score = best_score
+
+    # ── 用這個 fold 的最佳模型預測測試集 ──
+    model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()})
+    model.eval()
+
+    fold_action, fold_point, fold_sgp, fold_uids = [], [], [], []
+    with torch.no_grad():
+        for i, batch in enumerate(te_loader):
+            cat  = batch['cat'].to(DEVICE)
+            num  = batch['num'].to(DEVICE)
+            mask = batch['mask'].to(DEVICE)
+
+            logit_a, logit_p, logit_s = model(cat, num, mask)
+
+            if i == 0 and DEBUG_MODE and fold == 0:
+                print(f"DEBUG: logit_p[0, -1, :] = {logit_p[0, -1, :].cpu().numpy()}")
+
+            last_action = logit_a[:, -1, :]
+            last_point  = logit_p[:, -1, :]
+
+            # 存 softmax 機率，之後 ensemble 時取平均
+            fold_action.append(torch.softmax(last_action, dim=1).cpu().numpy())
+            fold_point.append(torch.softmax(last_point,   dim=1).cpu().numpy())
+            fold_sgp.append(torch.sigmoid(logit_s).cpu().numpy())
+            fold_uids.extend(batch['uid'])
+
+    all_fold_preds.append({
+        'action': np.concatenate(fold_action, axis=0),  # (N_test, N_ACTION_CLASSES)
+        'point':  np.concatenate(fold_point,  axis=0),  # (N_test, N_POINT_CLASSES)
+        'sgp':    np.concatenate(fold_sgp,    axis=0),  # (N_test,)
+    })
+
+print(f"\nOverall best val score across folds: {overall_best_score:.4f}")
+pd.DataFrame(all_history).to_csv("training_history.csv", index=False)
 print("Saved training_history.csv")
 
 # ──────────────────────────────────────────────
-# 10. 預測 & 11. 輸出 & 12. 儲存模型
+# 10. Ensemble 預測 & 輸出
 # ──────────────────────────────────────────────
-model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()})
-model.eval()
 
-all_uids, all_action_pred, all_point_pred, all_sgp_prob = [], [], [], []
+# 所有 fold 的預測取平均
+avg_action = np.mean([p['action'] for p in all_fold_preds], axis=0)  # (N_test, 19)
+avg_point  = np.mean([p['point']  for p in all_fold_preds], axis=0)  # (N_test, 10)
+avg_sgp    = np.mean([p['sgp']    for p in all_fold_preds], axis=0)  # (N_test,)
 
-with torch.no_grad():
-    for i, batch in enumerate(te_loader):
-        cat  = batch['cat'].to(DEVICE)
-        num  = batch['num'].to(DEVICE)
-        mask = batch['mask'].to(DEVICE)
+all_action_pred = avg_action.argmax(axis=1).tolist()
+all_point_pred  = avg_point.argmax(axis=1).tolist()
+all_sgp_prob    = avg_sgp.tolist()
 
-        logit_a, logit_p, logit_s = model(cat, num, mask)
+# pointId inverse transform
+le_point = encoders['pointId']
+final_point_ids = le_point.inverse_transform(np.array(all_point_pred))
 
-        # --- 檢查開始 ---
-        if i == 0: # 只看第一個 Batch 即可
-            print(f"DEBUG: logit_p Shape = {logit_p.shape}") 
-            # 預期輸出應該是 [256, 10] (假設 Batch 是 256, 類別是 10)
-            
-            # 看看前 5 筆資料的預測索引
-            preds = logit_p.argmax(dim=1).cpu().numpy()
-            print(f"DEBUG: 前 5 筆預測索引 = {preds[:5]}")
-            
-            # 看看原始 Logits 的數值（檢查是否數值都一模一樣導致坍塌）
-            print(f"DEBUG: 第一筆資料的 Logits = {logit_p[0].cpu().numpy()}")
-        # --- 檢查結束 ---
-        all_uids.extend(batch['uid'])
-        all_action_pred.extend(logit_a.argmax(dim=1).cpu().numpy())
-        all_point_pred.extend(logit_p.argmax(dim=1).cpu().numpy())
-        all_sgp_prob.extend(torch.sigmoid(logit_s).cpu().numpy())
+if DEBUG_MODE:
+    print(f"DEBUG: all_point_pred 前20筆 = {all_point_pred[:20]}")
+    print(f"DEBUG: all_point_pred 唯一值 = {set(all_point_pred)}")
+    print(f"DEBUG: 轉換後的前 5 筆 = {final_point_ids[:5]}")
 
 submission = pd.DataFrame({
-    'rally_uid':      all_uids,
+    'rally_uid':      fold_uids,
     'actionId':       all_action_pred,
-    'pointId':        all_point_pred,
-    'serverGetPoint': all_sgp_prob, # 1. 先存原始機率
+    'pointId':        final_point_ids,
+    'serverGetPoint': all_sgp_prob,
 })
 
-# 2. 檢查並填充 NaN (這很重要！)
+# NaN 檢查
 nan_count = submission['serverGetPoint'].isnull().sum()
 if nan_count > 0:
     print(f"⚠️ 警告：偵測到 {nan_count} 筆預測值為 NaN，已自動填充為 0")
     submission['serverGetPoint'] = submission['serverGetPoint'].fillna(0)
 
-# 3. 執行四捨五入並轉成整數
+# serverGetPoint 四捨五入
 submission['serverGetPoint'] = submission['serverGetPoint'].round().astype(int)
-# 1. 取得 pointId 的 LabelEncoder
-le_point = encoders['pointId']
 
-# 2. 獲取模型產出的原始索引 (0~9)
-# 假設 all_point_pred 是 logit_p.argmax(dim=1) 的集合
-raw_indices = np.array(all_point_pred)
-
-# 3. 檢查：如果你在訓練時用了 +1，那麼 argmax 得到的 0 其實對應的是 encoders 裡的 class 0
-# 但因為你儲存的是類別索引而非原始 ID，我們需要把它換回來
-# 這裡要很小心，因為 LabelEncoder 不知道你手動加了 1
-final_point_ids = le_point.inverse_transform(raw_indices)
-
-# 更新 submission
-submission['pointId'] = final_point_ids
-
-print(f"DEBUG: 轉換後的前 5 筆 = {final_point_ids[:5]}")
+# 輸出檔案
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
 filename = os.path.join(OUTPUT_DIR, f"submission_{timestamp}.csv")
-model_filename = os.path.join(OUTPUT_DIR, f"best_model_{timestamp}.pt")
-history_filename = os.path.join(OUTPUT_DIR, f"history_{timestamp}.csv")
 submission.to_csv(filename, index=False)
-
-# 強制覆蓋邏輯
-model_path = 'best_model.pt'
-if os.path.exists(model_path):
-    try:
-        os.remove(model_path) # 先手動砍掉，防止權限鎖定不讓蓋
-    except:
-        pass 
-
-# 儲存最優權重
-torch.save(best_state, model_path)
-
-# 💡 建議：同時存一個帶時間的版本在 all_submissions，這才是真的保險
-timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
-ver_path = os.path.join(OUTPUT_DIR, f"model_loss_{val_metrics['loss']:.4f}_{timestamp}.pt")
-torch.save(best_state, ver_path)
 print(f"✅ 檔案已成功產出：{filename}")
-
-#print("\n=== Done ===")
-#print(f"Final best validation score: {best_score:.4f}")
-#print("  Files produced:")
-#print("    submission.csv       <- 上傳用")
-#print("    best_model.pt        <- 模型權重")
-#print("    training_history.csv <- 訓練曲線")
